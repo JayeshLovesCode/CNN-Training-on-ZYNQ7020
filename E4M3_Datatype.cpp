@@ -1,8 +1,14 @@
 #include <ap_int.h>
+#include <hls_stream.h>
+#include <ap_axi_sdata.h>
+#include <ap_fixed.h>
 
 typedef ap_uint<8> fp8_e4m3;
+typedef ap_fixed<24,12,AP_TRN,AP_SAT> acc_t;
+typedef ap_axiu<8, 0, 0, 0> axis_t;
 
 fp8_e4m3 mult_fp8(fp8_e4m3 a, fp8_e4m3 b) {
+    #pragma HLS INLINE
     ap_uint<1> sign_a = a[7];
     ap_uint<4> exp_a  = a.range(6, 3);
     ap_uint<3> mant_a = a.range(2, 0);
@@ -55,86 +61,91 @@ fp8_e4m3 mult_fp8(fp8_e4m3 a, fp8_e4m3 b) {
     return result;
 }
 
-fp8_e4m3 add_fp8(fp8_e4m3 a, fp8_e4m3 b) {
+acc_t e4m3_to_fixed(fp8_e4m3 v) {
+    #pragma HLS INLINE
+    ap_uint<1> sign = v[7];
+    ap_uint<4> exp  = v.range(6,3);
+    ap_uint<3> mant = v.range(2,0);
 
-    ap_uint<1> sign_a = a[7];
-    ap_uint<4> exp_a  = a.range(6, 3);
-    ap_uint<4> mant_a = (1 << 3) | a.range(2, 0); // Add implicit leading 1
+    if (exp == 0) return (acc_t)0;
 
-    ap_uint<1> sign_b = b[7];
-    ap_uint<4> exp_b  = b.range(6, 3);
-    ap_uint<4> mant_b = (1 << 3) | b.range(2, 0);
+    // Value = 1.mant x 2^(exp-7);  1.mant as an integer is (8+mant)/8
+    ap_uint<4> m = (ap_uint<4>)(8 + mant);
+    int shift = (int)exp - 7 - 3;      // -3 undoes the /8
 
-    if (exp_a == 0) return b; 
-    if (exp_b == 0) return a;
+    acc_t val = (acc_t)m;
+    if (shift > 0)      val = val << shift;
+    else if (shift < 0) val = val >> (-shift);
 
-    // 2. ALIGN THE DECIMAL POINTS
-    ap_uint<4> final_exp = exp_a;
-    ap_uint<1> final_sign = sign_a;
-    ap_int<6>  aligned_a = mant_a; 
-    ap_int<6>  aligned_b = mant_b;
-
-    if (exp_a > exp_b) {
-        ap_uint<4> diff = exp_a - exp_b;
-        aligned_b = mant_b >> diff; 
-    } else if (exp_b > exp_a) {
-        ap_uint<4> diff = exp_b - exp_a;
-        aligned_a = mant_a >> diff;
-        final_exp = exp_b;
-        final_sign = sign_b;
-    } else {
-        // If exponents match, the sign depends on the larger mantissa
-        if (mant_b > mant_a) final_sign = sign_b;
-    }
-
-    // Apply signs to the aligned mantissas
-    if (sign_a == 1) aligned_a = -aligned_a;
-    if (sign_b == 1) aligned_b = -aligned_b;
-
-    ap_int<7> sum = aligned_a + aligned_b;
-
-    if (sum == 0) return 0;
-
-    // Check if result is negative and get absolute value 
-    if (sum < 0) {
-        final_sign = 1;
-        sum = -sum;
-    } else {
-        final_sign = 0;
-    }
-
-    ap_uint<6> abs_sum = sum;
-    
-    if (abs_sum & (1 << 4)) { // Sum overflowed 
-        abs_sum >>= 1;
-        final_exp += 1;
-    } else {
-        // Shift left until the 3rd bit is a 1 
-        while ((abs_sum & (1 << 3)) == 0 && final_exp > 0) {
-            abs_sum <<= 1;
-            final_exp -= 1;
-        }
-    }
-
-    fp8_e4m3 result;
-    result[7] = final_sign;
-    
-    // Check underflow/overflow
-    if (final_exp <= 0) return 0;
-    if (final_exp >= 15) {
-        result.range(6, 3) = 15;
-        result.range(2, 0) = 6;
-        return result;
-    }
-
-    result.range(6, 3) = final_exp;
-    result.range(2, 0) = abs_sum.range(2, 0); 
-    
-    return result;
+    return sign ? (acc_t)(-val) : val;
 }
 
-fp8_e4m3 mac_fp8(fp8_e4m3 pixel, fp8_e4m3 weight, fp8_e4m3 current_sum) {
-    fp8_e4m3 mult_result = mult_fp8(pixel, weight);
-    fp8_e4m3 new_sum = add_fp8(current_sum, mult_result);
-    return new_sum;
+fp8_e4m3 fixed_to_e4m3(acc_t v) {
+    #pragma HLS INLINE
+    bool neg = (v < 0);
+    acc_t a = neg ? (acc_t)(-v) : v;
+
+    if (a == 0) return 0;
+    // Above 2^8 is outside E4M3's exponent range - clamp to max (matches float_to_e4m3)
+    if (a >= (acc_t)256) {
+        fp8_e4m3 sat;
+        sat[7] = neg ? 1 : 0;
+        sat.range(6,3) = 14;
+        sat.range(2,0) = 7;
+        return sat;
+    }
+    // Find the exponent: largest e with 2^e <= a, searched over E4M3's range
+    int e = -7;
+    for (int k = 7; k >= -6; k--) {
+        #pragma HLS UNROLL
+        acc_t p = (k >= 0) ? (acc_t)(1 << k) : (acc_t)(acc_t(1) >> (-k));
+        if (a >= p) { e = k; break; }
+    }
+
+    // Normalize to 1.mant, extract 3 mantissa bits
+    acc_t norm = (e >= 0) ? (acc_t)(a >> e) : (acc_t)(a << (-e));   // in [1,2)
+    acc_t frac = norm - (acc_t)1;
+    ap_uint<3> mant = (ap_uint<3>)(int)(frac * 8);
+
+    int biased = e + 7;
+    fp8_e4m3 out;
+    out[7] = neg ? 1 : 0;
+    if (biased <= 0)       { out.range(6,0) = 0; }
+    else if (biased >= 15) { out.range(6,3) = 14; out.range(2,0) = 7; }
+    else                   { out.range(6,3) = biased; out.range(2,0) = mant; }
+    return out;
+}
+
+void fp8_dot_product(hls::stream<axis_t>& pixel_stream,
+                     hls::stream<axis_t>& weight_stream,
+                     hls::stream<axis_t>& output_stream,
+                     int array_length) {
+
+    #pragma HLS INTERFACE axis port=pixel_stream
+    #pragma HLS INTERFACE axis port=weight_stream
+    #pragma HLS INTERFACE axis port=output_stream
+    #pragma HLS INTERFACE s_axilite port=array_length bundle=CTRL
+    #pragma HLS INTERFACE s_axilite port=return bundle=CTRL
+
+    acc_t running_sum = 0;
+
+    for (int i = 0; i < array_length; i++) {
+        #pragma HLS PIPELINE
+        axis_t p_pkt = pixel_stream.read();
+        axis_t w_pkt = weight_stream.read();
+
+        // Multiply in E4M3 (cheap, and matches your existing unit)
+        fp8_e4m3 prod = mult_fp8(p_pkt.data, w_pkt.data);
+
+        // Accumulate at full precision
+        running_sum += e4m3_to_fixed(prod);
+    }
+
+    axis_t final_packet;
+    final_packet.data = fixed_to_e4m3(running_sum);
+    final_packet.last = 1;
+    final_packet.keep = 1;
+    final_packet.strb = 1;
+
+    output_stream.write(final_packet);
 }
