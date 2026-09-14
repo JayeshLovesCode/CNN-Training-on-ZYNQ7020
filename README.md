@@ -123,7 +123,3 @@ arithmetic unit, the end-of-packet marker, and the write back to DDR.
 - Weights are scaled by a power of two before encoding, since the values are otherwise below the
   E4M3 lower limit and encode to zero. The scale factor is selected at run time and divided out
   in software.
-- Feature extraction runs approximately 2.7 million accelerator invocations and takes several
-  minutes. Progress is printed every 25 samples.
-- `feat_cache` occupies 676 KB. If linking fails, confirm that `.bss` is mapped to `ps7_ddr_0`
-  in the linker script.
